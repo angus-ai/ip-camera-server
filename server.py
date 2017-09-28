@@ -20,8 +20,7 @@
 import os
 import StringIO
 import datetime
-import threading
-import logging
+import multiprocessing
 
 import tornado.ioloop
 import tornado.web
@@ -42,16 +41,20 @@ ANGUS_GATE = os.environ.get("ANGUS_GATE", "https://gate.angus.ai")
 
 STREAM_URL = os.environ.get("STREAM_URL", None)
 
-LOGGER = logging.getLogger(__name__)
-
 DEBUG = False
 
-class Grabber(threading.Thread):
-    def __init__(self, context):
-        super(Grabber, self).__init__()
-        self.context = context
+class Computer(multiprocessing.Process):
+    def __init__(self, output):
+        super(Computer, self).__init__()
+        self.input = multiprocessing.Queue()
+        self.output = output
+
+    def send(self, timestamp, frame):
+        self.input.put((timestamp, frame))
 
     def run(self):
+        print("Computer module start")
+
         conf = angus.client.rest.Configuration()
         conf.set_credential(CLIENT_ID, ACCESS_TOKEN)
         conn = angus.client.cloud.Root(ANGUS_GATE, conf)
@@ -59,56 +62,127 @@ class Grabber(threading.Thread):
         service = conn.services.get_service("scene_analysis", version=1)
         service.enable_session()
 
-        results = list()
-        cap = cv2.VideoCapture(STREAM_URL)
+        print("Prepare to compute frames")
 
-        while cap.isOpened():
-            _, frame = cap.read()
-            if frame is None:
+        while True:
+
+            # Tricks to get the last frame (and drop the others)
+            while True:
+                try:
+                    self.input.get_nowait()
+                except:
+                    break
+            to_compute = self.input.get()
+
+            # Quit if it is the end
+            if to_compute is None:
                 break
+            timestamp, frame = to_compute
 
-            timestamp = datetime.datetime.now(pytz.utc)
-
+            # Prepare frame to send to angus.ai
             _, buff = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
             buff = StringIO.StringIO(np.array(buff).tostring())
 
+            # Process
             job = service.process({
                 "image": buff,
                 "timestamp": timestamp.isoformat(),
             })
 
-            print job.result
+            res = job.result
+            print("Request to gate.angus.ai: DONE")
 
-        return results
+            if "error" in res:
+                print(res["error"])
+                continue
 
+            # Print an onverlay
+            for _, val in res["entities"].iteritems():
+                x, y, dx, dy = map(int, val["face_roi"])
+                cv2.rectangle(frame, (x, y), (x+dx, y+dy), (0, 255, 0), 2)
+
+            # Re-encode to send to the webserver
+            _, frame = cv2.imencode(".jpg", frame,
+                                        [cv2.IMWRITE_JPEG_QUALITY, 50])
+            frame = frame.tostring()
+
+            # Send to webserver
+            self.output.put_nowait(frame)
+
+class Grabber(multiprocessing.Process):
+    def __init__(self, computer):
+        super(Grabber, self).__init__()
+        self.computer = computer
+
+    def run(self):
+        print("Grabber module start")
+
+        cap = cv2.VideoCapture(STREAM_URL)
+
+        print("Prepare to get stream")
+
+        while cap.isOpened():
+            print("Grab a frame")
+            _, frame = cap.read()
+            if frame is None:
+                break
+            timestamp = datetime.datetime.now(pytz.utc)
+
+            self.computer.send(timestamp, frame)
 
 class OutputHandler(tornado.web.RequestHandler):
-    def initialize(self, context=None):
-        self.context = context
+    """
+    Simple MJPEG Server
+    """
+    def initialize(self, frames=None):
+        self.frames = frames
+        self.up = True
 
+    @tornado.gen.coroutine
     def get(self):
-        self.write("Ok")
+        self.set_header( 'Content-Type', 'multipart/x-mixed-replace;boundary=--myboundary')
+
+        while self.up:
+            frame = self.frames.get()
+            if frame is None:
+                # Wait a first frame
+                yield tornado.gen.sleep(0.5)
+                continue
+
+            response = "\r\n".join(("--myboundary",
+                                    "Content-Type: image/jpeg",
+                                    "Content-Length: " + str(len(frame)),
+                                    "",
+                                    frame,
+                                    ""))
+            self.write(response)
+            yield self.flush()
+
+    def on_connection_close(self):
+        self.up = False
 
 def make_app():
-    context = None
+    frames = multiprocessing.Queue()
 
-    grabber = Grabber(context)
+    computer = Computer(frames)
+    computer.daemon = True
+    computer.start()
+
+    grabber = Grabber(computer)
     grabber.daemon = True
     grabber.start()
 
     return tornado.web.Application([
-        (r"/video", OutputHandler, dict(context=context))
+        (r"/", OutputHandler, dict(frames=frames))
     ])
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.DEBUG)
-
     if CLIENT_ID is None or ACCESS_TOKEN is None:
-        LOGGER.error("Please set CLIENT_ID and ACCESS_TOKEN")
+        print("Please set CLIENT_ID and ACCESS_TOKEN")
         sys.exit(-1)
 
     if STREAM_URL is None:
-        LOGGER.error("Please set STREAM_URL")
+        print("Please set STREAM_URL")
         sys.exit(-1)
 
     app = make_app()
